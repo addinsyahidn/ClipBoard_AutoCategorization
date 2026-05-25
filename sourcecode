@@ -1,0 +1,148 @@
+import pygame as pg, sys, pyttsx3, threading, numpy as np, tkinter as tk
+
+pg.init(); pg.mixer.init(44100, -16, 1)
+layar = pg.display.set_mode((950, 550), pg.RESIZABLE)
+pg.display.set_caption("Google Translate - Morse Edition Pro")
+f_t, f_j = pg.font.SysFont("Courier", 22, 1), pg.font.SysFont("Arial", 16, 1)
+C_BG, C_W, C_T1, C_T2, C_B, C_H, C_G, C_BT = (248,249,250), (255,255,255), (32,33,36), (95,99,104), (26,115,232), (22,101,204), (218,220,224), (241,243,244)
+A = " ,-./?@0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+M = ["  ", "--..--", "-....-", ".-.-.-", "-..-.", "..--..", ".--.-.", "-----", ".----", "..---", "...--", "....-", ".....", "-....", "--...", "---..", "----.", ".-", "-...", "-.-.", "-..", ".", "..-.", "--.", "....", "..", ".---", "-.-", ".-..", "--", "-.", "---", ".--.", "--.-", ".-.", "...", "-", "..-", "...-", ".--", "-..-", "-.--", "--.."]
+E_D, D_D = dict(zip(A, M)), dict(zip(M, A))
+txt, spd, gen, t_jd, t_wt, p_st, l_st, rev, tts_st, cp_tm, run = "", 1.0, None, 0, 0, False, False, False, False, 0, True
+
+def tts_play(t):
+    global tts_st
+    if t.strip() and not tts_st:
+        tts_st = True
+        def run_tts():
+            global tts_st
+            try:
+                eng = pyttsx3.init(); v = eng.getProperty('voices')
+                if v: eng.setProperty('voice', v[0].id)
+                eng.setProperty('rate', int(150 * spd)); eng.say(t); eng.runAndWait()
+            except: pass
+            tts_st = False
+        threading.Thread(target=run_tts, daemon=True).start()
+
+def draw_btn(lyr, pos, x, y, tp, akt=False):
+    r = pg.Rect(x, y, 40, 40); h = r.collidepoint(pos); w = C_B if akt else (C_H if h else C_T2)
+    if h or akt: pg.draw.rect(lyr, C_BT if not akt else (232,240,254), r, border_radius=8)
+    if tp == 'replay':
+        pg.draw.arc(lyr, w, (x+10, y+10, 20, 20), 0.5, 5.5, 3)
+        pg.draw.polygon(lyr, w, [(x+22, y+6), (x+30, y+12), (x+22, y+18)])
+    elif tp in ['play', 'pause']:
+        if tp == 'play': pg.draw.polygon(lyr, w, [(x+16, y+11), (x+16, y+29), (x+29, y+20)])
+        else: pg.draw.rect(lyr, w, (x+14, y+12, 4, 16)); pg.draw.rect(lyr, w, (x+22, y+12, 4, 16))
+    elif tp in ['slow', 'fast']:
+        pg.draw.line(lyr, w, (x+12, y+20), (x+28, y+20), 3)
+        if tp == 'fast': pg.draw.line(lyr, w, (x+20, y+12), (x+20, y+28), 3)
+    elif tp == 'loop':
+        pg.draw.arc(lyr, w, (x+10, y+10, 20, 20), 0, 5.8, 3)
+        pg.draw.polygon(lyr, w, [(x+25, y+18), (x+32, y+24), (x+23, y+30)])
+    elif tp == 'copy':
+        pg.draw.rect(lyr, w, (x+16, y+10, 14, 18), 2, 2)
+        pg.draw.rect(lyr, C_BT if h or akt else C_BG, (x+10, y+14, 14, 18))
+        pg.draw.rect(lyr, w, (x+10, y+14, 14, 18), 2, 2)
+    elif tp == 'swap':
+        pg.draw.line(lyr, w, (x+8, y+15), (x+32, y+15), 3); pg.draw.polygon(lyr, w, [(x+32, y+11), (x+32, y+19), (x+38, y+15)])
+        pg.draw.line(lyr, w, (x+8, y+25), (x+32, y+25), 3); pg.draw.polygon(lyr, w, [(x+8, y+21), (x+8, y+29), (x+2, y+25)])
+    elif tp == 'clear':
+        pg.draw.line(lyr, w, (x+12, y+12), (x+28, y+28), 3); pg.draw.line(lyr, w, (x+28, y+12), (x+12, y+28), 3)
+    return r
+
+def wrap_t(t, font, mx):
+    b, cur = [], ""
+    for k in t.split(' '):
+        if font.size(cur + k + " ")[0] < mx: cur += k + " "
+        else: b.append(cur); cur = k + " "
+    return b + [cur]
+
+while run:
+    layar.fill(C_BG)
+    pos_m, L, T = pg.mouse.get_pos(), layar.get_width(), layar.get_height()
+    w_k, h_k, y_b = (L - 90) // 2, T - 130, T - 110
+    r_ki, r_ka = pg.Rect(30, 80, w_k, h_k), pg.Rect(60 + w_k, 80, w_k, h_k)
+    m_act = " ".join([E_D.get(c, "") for c in txt.upper()]) if not rev else txt
+    a_act = txt if not rev else "".join([D_D.get(k, " " if k=="" else "?") for k in txt.split(" ")]).replace("  ", " ")
+    out_t = a_act if rev else m_act
+
+    if gen and not p_st and not rev:
+        if pg.time.get_ticks() - t_jd >= t_wt:
+            try: t_wt = next(gen); t_jd = pg.time.get_ticks()
+            except StopIteration:
+                def audio_gen(tk):
+                    s_dt = pg.mixer.Sound(buffer=(np.sin(2 * np.pi * 700 * np.linspace(0, int(100/spd)/1000.0, int(44100*(int(100/spd)/1000.0)), False)) * 32767).astype(np.int16).tobytes())
+                    s_ds = pg.mixer.Sound(buffer=(np.sin(2 * np.pi * 700 * np.linspace(0, int(300/spd)/1000.0, int(44100*(int(300/spd)/1000.0)), False)) * 32767).astype(np.int16).tobytes())
+                    for s in tk:
+                        if s in '.-': (s_dt if s=='.' else s_ds).play(); yield int(120 / spd)
+                        elif s == ' ': yield int(350 / spd)
+                gen = audio_gen(m_act) if l_st and m_act else None; t_wt = 0
+
+    def copy_act():
+        global cp_tm
+        try:
+            root = tk.Tk(); root.withdraw(); root.clipboard_clear(); root.clipboard_append(out_t); root.update(); root.destroy()
+            cp_tm = pg.time.get_ticks()
+        except: pass
+
+    for event in pg.event.get():
+        if event.type == pg.QUIT: run = False
+        elif event.type == pg.VIDEORESIZE: layar = pg.display.set_mode((event.w, event.h), pg.RESIZABLE)
+        elif event.type == pg.MOUSEBUTTONDOWN and event.button == 1:
+            if b_sw.collidepoint(event.pos): rev, txt = not rev, ""; pg.mixer.stop(); gen = None
+            elif b_cl.collidepoint(event.pos): txt = ""; pg.mixer.stop(); gen = None
+            elif b_cp.collidepoint(event.pos) and out_t.strip(): copy_act()
+            elif b_pl.collidepoint(event.pos) and m_act:
+                if rev: tts_play(a_act)
+                elif not gen:
+                    def audio_gen(tk):
+                        s_dt = pg.mixer.Sound(buffer=(np.sin(2 * np.pi * 700 * np.linspace(0, int(100/spd)/1000.0, int(44100*(int(100/spd)/1000.0)), False)) * 32767).astype(np.int16).tobytes())
+                        s_ds = pg.mixer.Sound(buffer=(np.sin(2 * np.pi * 700 * np.linspace(0, int(300/spd)/1000.0, int(44100*(int(300/spd)/1000.0)), False)) * 32767).astype(np.int16).tobytes())
+                        for s in tk:
+                            if s in '.-': (s_dt if s=='.' else s_ds).play(); yield int(120 / spd)
+                            elif s == ' ': yield int(350 / spd)
+                    gen, p_st = audio_gen(m_act), False
+                else: p_st = not p_st; pg.mixer.stop() if p_st else None
+            elif b_rp.collidepoint(event.pos) and m_act:
+                pg.mixer.stop(); tts_play(a_act) if rev else None
+                def audio_gen(tk):
+                    s_dt = pg.mixer.Sound(buffer=(np.sin(2 * np.pi * 700 * np.linspace(0, int(100/spd)/1000.0, int(44100*(int(100/spd)/1000.0)), False)) * 32767).astype(np.int16).tobytes())
+                    s_ds = pg.mixer.Sound(buffer=(np.sin(2 * np.pi * 700 * np.linspace(0, int(300/spd)/1000.0, int(44100*(int(300/spd)/1000.0)), False)) * 32767).astype(np.int16).tobytes())
+                    for s in tk:
+                        if s in '.-': (s_dt if s=='.' else s_ds).play(); yield int(120 / spd)
+                        elif s == ' ': yield int(350 / spd)
+                gen, p_st, t_wt = audio_gen(m_act), not rev, 0
+            elif b_sl.collidepoint(event.pos): spd = max(0.5, spd - 0.25); gen = audio_gen(m_act) if gen and not p_st and not rev else gen
+            elif b_fs.collidepoint(event.pos): spd = min(2.0, spd + 0.25); gen = audio_gen(m_act) if gen and not p_st and not rev else gen
+            elif b_lp.collidepoint(event.pos): l_st = not l_st
+        elif event.type == pg.KEYDOWN:
+            k = pg.key.get_pressed()
+            if (k[pg.K_LCTRL] or k[pg.K_RCTRL]) and event.key == pg.K_c: copy_act()
+            elif (k[pg.K_LCTRL] or k[pg.K_RCTRL]) and event.key == pg.K_v:
+                try:
+                    r_tk = tk.Tk(); r_tk.withdraw(); cb = r_tk.clipboard_get(); r_tk.destroy()
+                    for c in cb: txt += c if (rev and c in ".- ") or (not rev and c.upper() in A) else ""
+                except: pass
+            elif event.key == pg.K_BACKSPACE: txt = txt[:-1]; pg.mixer.stop(); gen = None
+            elif rev and event.unicode in ".- ": txt += event.unicode
+            elif not rev and event.unicode.upper() in A: txt += event.unicode
+
+    pg.draw.rect(layar, C_W, r_ki, border_radius=8); pg.draw.rect(layar, C_B, r_ki, 2, 8)
+    pg.draw.rect(layar, C_W, r_ka, border_radius=8); pg.draw.rect(layar, C_G, r_ka, 1, 8)
+    
+    j_ki, j_ka = f_j.render("KODE MORSE" if rev else "TEKS BIASA (ALFABET)", 1, C_B), f_j.render(f"{'TEKS BIASA' if rev else 'KODE MORSE'} (Kecepatan: {spd:.2f}x)", 1, C_T2)
+    layar.blit(j_ki, (30 + (w_k // 2) - (j_ki.get_width() // 2), 50))
+    layar.blit(j_ka, ((60 + w_k) + (w_k // 2) - (j_ka.get_width() // 2), 50))
+
+    for i, t in enumerate(wrap_t(txt + "|", f_t, w_k - 40)): layar.blit(f_t.render(t, 1, C_T1), (50, 100 + i * 28))
+    for i, t in enumerate(wrap_t(out_t, f_t, w_k - 40)): layar.blit(f_t.render(t, 1, C_T1), (80 + w_k, 100 + i * 28))
+
+    xb = 60 + w_k
+    b_sw, b_cl = draw_btn(layar, pos_m, 30 + w_k + 5, 40, 'swap'), draw_btn(layar, pos_m, 30 + w_k - 50, 90, 'clear')
+    b_rp, b_sl = draw_btn(layar, pos_m, xb + 20, y_b, 'replay'), draw_btn(layar, pos_m, xb + 120, y_b, 'slow')
+    b_pl = draw_btn(layar, pos_m, xb + 70, y_b, 'pause' if (gen and not p_st and not rev) else 'play')
+    b_fs, b_lp = draw_btn(layar, pos_m, xb + 170, y_b, 'fast'), draw_btn(layar, pos_m, xb + 220, y_b, 'loop', l_st)
+    b_cp = draw_btn(layar, pos_m, xb + 270, y_b, 'copy', pg.time.get_ticks() - cp_tm < 300)
+    pg.display.flip()
+
+pg.quit(); sys.exit()
