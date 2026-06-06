@@ -5,6 +5,17 @@ Segmented Clipboard Manager
 - Setiap teks baru otomatis dikategorikan & disimpan ke clipboard_data.json
 - GUI pygame dengan mode Normal (1000x660) dan PiP / always-on-top (320x500)
 - Data persisten antar sesi (tersimpan di file JSON)
+
+CHANGELOG (perbaikan):
+  - Font fallback untuk Linux/macOS (Segoe UI → DejaVu Sans → Arial → default)
+  - save_data() dibungkus try/except + log error ke GUI
+  - evict item sekarang muncul di status bar GUI
+  - card_actions tidak lagi di-reset di awal render() — dikumpulkan fresh setiap frame
+  - Koordinat klik tombol di GUINormal kini konsisten (dihitung sekali saat render)
+  - scroll_y dipindah ke GUINormal/GUIPip (bukan di app), tab-switch reset scroll
+  - Kategori UMUM/BELANJA tetap di loop rules (tidak hanya fallback) — konsisten
+  - Thread monitor pakai Event() untuk stop graceful
+  - Perbaikan minor: truncate PiP lebih pendek agar tombol hapus tidak overlap
 """
 
 import pygame
@@ -68,6 +79,8 @@ KATEGORI_RULES = {
         "exact": ["+62", "wa:", "no hp"],
         "word":  ["telp", "whatsapp", "phone"],
     },
+    # UMUM/BELANJA diperlakukan sama seperti kategori lain (rules kosong = tidak
+    # pernah match via exact/word, hanya dicapai lewat fallback di kategorikan())
     "🛒 UMUM/BELANJA": {"exact": [], "word": []},
 }
 
@@ -94,6 +107,22 @@ C = {
     "pip_active": (0, 180, 130),
 }
 
+# ─── Font helper ─────────────────────────────────────────────────────────────
+def make_font(size: int, bold: bool = False) -> pygame.font.Font:
+    """
+    Coba muat font dengan fallback agar tidak crash di Linux/macOS yang
+    tidak punya Segoe UI.
+    """
+    candidates = ["Segoe UI", "DejaVu Sans", "Arial", "Liberation Sans"]
+    for name in candidates:
+        try:
+            f = pygame.font.SysFont(name, size, bold=bold)
+            if f is not None:
+                return f
+        except Exception:
+            pass
+    return pygame.font.SysFont(None, size, bold=bold)  # pygame default font
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # STORAGE
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -106,13 +135,21 @@ def load_data() -> dict:
             for k in base:
                 if k in saved and isinstance(saved[k], list):
                     base[k] = saved[k]
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"⚠️  Gagal load data: {e}")
     return base
 
-def save_data(data: dict):
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+
+def save_data(data: dict) -> str | None:
+    """
+    Simpan data ke JSON. Return pesan error (str) jika gagal, None jika sukses.
+    """
+    try:
+        with open(DATA_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        return None
+    except Exception as e:
+        return f"❌ Gagal simpan: {str(e)[:60]}"
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # KATEGORISASI
@@ -120,6 +157,9 @@ def save_data(data: dict):
 def kategorikan(teks: str) -> str:
     t = teks.lower()
     for nama, rules in KATEGORI_RULES.items():
+        # Lewati UMUM/BELANJA dalam loop — ia selalu jadi fallback
+        if nama == "🛒 UMUM/BELANJA":
+            continue
         if any(kw in t for kw in rules.get("exact", [])):
             return nama
         for kw in rules.get("word", []):
@@ -137,16 +177,12 @@ def set_always_on_top(enabled: bool):
         if plat == "Windows":
             import ctypes
             hwnd = pygame.display.get_wm_info()["window"]
-            HWND_TOPMOST    = -1
-            HWND_NOTOPMOST  = -2
-            SWP_FLAGS       = 0x0001 | 0x0002  # NOSIZE | NOMOVE
+            HWND_TOPMOST   = -1
+            HWND_NOTOPMOST = -2
+            SWP_FLAGS      = 0x0001 | 0x0002  # NOSIZE | NOMOVE
             target = HWND_TOPMOST if enabled else HWND_NOTOPMOST
             ctypes.windll.user32.SetWindowPos(hwnd, target, 0, 0, 0, 0, SWP_FLAGS)
-        elif plat == "Darwin":
-            # macOS: pakai wmctrl tidak tersedia, tapi SDL hint bisa diset sebelum init
-            pass  # macOS support lewat SDL_VIDEO_WINDOW_ALWAYS_ON_TOP env var
         elif plat == "Linux":
-            # Linux: gunakan xdotool / wmctrl jika tersedia
             wm_info = pygame.display.get_wm_info()
             wid = wm_info.get("window")
             if wid:
@@ -155,8 +191,9 @@ def set_always_on_top(enabled: bool):
                     ["wmctrl", "-i", "-r", hex(wid), "-b", f"{prop},above"],
                     stderr=subprocess.DEVNULL
                 )
+        # macOS: SDL_VIDEO_WINDOW_ALWAYS_ON_TOP env var di-set sebelum pygame.init()
     except Exception:
-        pass  # Silent fail — PiP mode tetap jalan tanpa always-on-top
+        pass  # Silent fail — PiP tetap jalan tanpa always-on-top
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # APP STATE
@@ -168,13 +205,12 @@ class ClipboardApp:
         self.log_color    = C["accent"]
         self.last_clip    = ""
         self.selected_tab = list(KATEGORI_RULES.keys())[0]
-        self.scroll_y     = 0
-        self.monitoring   = True
         self._lock        = threading.Lock()
+        self._stop_event  = threading.Event()  # untuk stop thread secara graceful
 
     def start_monitor(self):
         def loop():
-            while self.monitoring:
+            while not self._stop_event.is_set():
                 try:
                     clip = pyperclip.paste()
                     if clip and clip != self.last_clip and clip.strip():
@@ -182,70 +218,88 @@ class ClipboardApp:
                         self.tambah(clip.strip())
                 except Exception:
                     pass
-                time.sleep(POLL_INTERVAL)
+                # Gunakan wait() agar bisa di-interrupt oleh stop_event
+                self._stop_event.wait(timeout=POLL_INTERVAL)
         threading.Thread(target=loop, daemon=True).start()
+
+    def stop_monitor(self):
+        self._stop_event.set()
 
     def tambah(self, teks: str):
         kategori = kategorikan(teks)
         with self._lock:
             lst = self.data.setdefault(kategori, [])
+            # Hapus duplikat terlebih dulu
             lst[:] = [e for e in lst if e["teks"] != teks]
             if len(lst) >= MAX_SLOT:
                 evicted = lst.pop(0)
-                print(f"⚠️  Evict: {evicted['teks'][:50]}")
+                # Tampilkan notifikasi evict di status bar
+                self.log       = f"⚠️ Slot penuh, dihapus: \"{evicted['teks'][:35]}...\""
+                self.log_color = C["yellow"]
             lst.append({
                 "teks":    teks,
                 "waktu":   datetime.now().strftime("%d/%m %H:%M"),
                 "panjang": len(teks),
             })
-            save_data(self.data)
-            self.log = "📥 " + kategori + "  |  \"" + teks[:40] + ("..." if len(teks) > 40 else "") + "\""
-            self.log_color = C["accent"]
+            err = save_data(self.data)
+            if err:
+                self.log       = err
+                self.log_color = C["red"]
+            else:
+                self.log       = "📥 " + kategori + "  |  \"" + teks[:40] + ("..." if len(teks) > 40 else "") + "\""
+                self.log_color = C["accent"]
 
     def hapus(self, kategori: str, idx: int):
         with self._lock:
             lst = self.data.get(kategori, [])
             if 0 <= idx < len(lst):
                 lst.pop(idx)
-                save_data(self.data)
-                self.log = "🗑️ Dihapus dari " + kategori
-                self.log_color = C["yellow"]
+                err = save_data(self.data)
+                if err:
+                    self.log       = err
+                    self.log_color = C["red"]
+                else:
+                    self.log       = "🗑️ Dihapus dari " + kategori
+                    self.log_color = C["yellow"]
 
     def salin(self, kategori: str, idx: int):
         if not CLIPBOARD_OK:
-            self.log = "❌ pyperclip tidak tersedia"
+            self.log       = "❌ pyperclip tidak tersedia"
             self.log_color = C["red"]
             return
-        lst = self.data.get(kategori, [])
-        if not (0 <= idx < len(lst)):
-            return
-        teks = lst[idx]["teks"]
+        with self._lock:
+            lst = self.data.get(kategori, [])
+            if not (0 <= idx < len(lst)):
+                return
+            teks = lst[idx]["teks"]
         try:
             pyperclip.copy(teks)
-            self.log = "📋 Disalin: \"" + teks[:50] + ("..." if len(teks) > 50 else "") + "\""
+            self.log       = "📋 Disalin: \"" + teks[:50] + ("..." if len(teks) > 50 else "") + "\""
             self.log_color = C["accent2"]
         except Exception as e:
-            self.log = "❌ Gagal salin: " + str(e)[:60]
+            self.log       = "❌ Gagal salin: " + str(e)[:60]
             self.log_color = C["red"]
 
     def kirim_wa(self, kategori: str, idx: int):
         if not PYWHATKIT_OK:
-            self.log = "❌ pywhatkit tidak ada. pip install pywhatkit"
+            self.log       = "❌ pywhatkit tidak ada. pip install pywhatkit"
             self.log_color = C["red"]
             return
-        lst = self.data.get(kategori, [])
-        if not (0 <= idx < len(lst)):
-            return
-        teks = lst[idx]["teks"]
+        with self._lock:
+            lst = self.data.get(kategori, [])
+            if not (0 <= idx < len(lst)):
+                return
+            teks = lst[idx]["teks"]
+
         def send():
             try:
-                self.log = "🚀 Mengirim ke " + NOMOR_TARGET + "..."
+                self.log       = "🚀 Mengirim ke " + NOMOR_TARGET + "..."
                 self.log_color = C["yellow"]
                 kit.sendwhatmsg_instantly(NOMOR_TARGET, teks, wait_time=15, tab_close=True)
-                self.log = "🟢 Pesan berhasil dikirim!"
+                self.log       = "🟢 Pesan berhasil dikirim!"
                 self.log_color = C["green"]
             except Exception as e:
-                self.log = "❌ Gagal kirim: " + str(e)[:60]
+                self.log       = "❌ Gagal kirim: " + str(e)[:60]
                 self.log_color = C["red"]
         threading.Thread(target=send, daemon=True).start()
 
@@ -263,7 +317,7 @@ def draw_rounded_rect(surf, color, rect, r=8, border=0, border_color=None):
     if border and border_color:
         pygame.draw.rect(surf, border_color, rect, width=border, border_radius=r)
 
-def truncate(s, n):
+def truncate(s: str, n: int) -> str:
     return s[:n] + "..." if len(s) > n else s
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -273,21 +327,24 @@ class GUINormal:
     def __init__(self, app: ClipboardApp, surf):
         self.app          = app
         self.surf         = surf
-        self.tab_rects    = []
-        self.card_actions = []
+        self.tab_rects: list  = []
+        self.card_actions: list = []
         self.btn_pip_rect = None
+        self.scroll_y     = 0   # scroll disimpan di sini, bukan di app
 
-        self.fnt_title = pygame.font.SysFont("Segoe UI", 22, bold=True)
-        self.fnt_sub   = pygame.font.SysFont("Segoe UI", 15, bold=True)
-        self.fnt_reg   = pygame.font.SysFont("Segoe UI", 13)
-        self.fnt_small = pygame.font.SysFont("Segoe UI", 11)
-        self.fnt_mono  = pygame.font.SysFont("Courier New", 12)
+        self.fnt_title = make_font(22, bold=True)
+        self.fnt_sub   = make_font(15, bold=True)
+        self.fnt_reg   = make_font(13)
+        self.fnt_small = make_font(11)
+        self.fnt_mono  = make_font(12)
 
     def render(self):
         surf  = self.surf
         W, H  = surf.get_size()
         mouse = pygame.mouse.get_pos()
         surf.fill(C["bg"])
+
+        # Reset setiap frame
         self.tab_rects    = []
         self.card_actions = []
 
@@ -299,7 +356,7 @@ class GUINormal:
         surf.blit(ttl, (20, 14))
 
         # Tombol PiP di kanan header
-        pip_lbl = self.fnt_small.render("[ ] PiP", True, C["text_dim"])
+        pip_lbl = self.fnt_small.render("⊞ PiP Mode", True, C["text_dim"])
         pw = pip_lbl.get_width() + 20
         pip_rect = pygame.Rect(W - pw - 12, 14, pw, 28)
         hp = pip_rect.collidepoint(mouse)
@@ -309,10 +366,8 @@ class GUINormal:
                   (pip_rect.x + 8, pip_rect.y + 7))
         self.btn_pip_rect = pip_rect
 
-        total_txt = self.fnt_reg.render(
-            f"Total: {self.app.total()} entri  |  "
-            f"{'🟢 Monitoring' if CLIPBOARD_OK else '🔴 No pyperclip'}",
-            True, C["text_dim"])
+        status_txt = f"Total: {self.app.total()} entri  |  {'🟢 Monitoring' if CLIPBOARD_OK else '🔴 No pyperclip'}"
+        total_txt = self.fnt_reg.render(status_txt, True, C["text_dim"])
         surf.blit(total_txt, (W - total_txt.get_width() - pip_rect.width - 28, 18))
 
         # ── Tabs ─────────────────────────────────────────────────────────────
@@ -324,8 +379,7 @@ class GUINormal:
             rect  = pygame.Rect(tx, 66, tw, 34)
             aktif = nama == self.app.selected_tab
             draw_rounded_rect(surf, C["accent"] if aktif else C["card"], rect, r=6,
-                              border=0 if aktif else 1,
-                              border_color=C["border"])
+                              border=0 if aktif else 1, border_color=C["border"])
             surf.blit(self.fnt_sub.render(label, True,
                       C["bg"] if aktif else C["text_dim"]), (tx + 12, 74))
             self.tab_rects.append({"rect": rect, "nama": nama})
@@ -340,17 +394,17 @@ class GUINormal:
             surf.blit(em, (W // 2 - em.get_width() // 2, H // 2 - 20))
         else:
             max_scroll = max(0, len(lst) * 84 - (H - content_top - 70))
-            self.app.scroll_y = max(0, min(self.app.scroll_y, max_scroll))
+            self.scroll_y = max(0, min(self.scroll_y, max_scroll))
 
-            clip_h = H - content_top - 70
+            clip_h   = H - content_top - 70
             clip_surf = pygame.Surface((W, clip_h), pygame.SRCALPHA)
             clip_surf.fill((0, 0, 0, 0))
 
             for i, entri in enumerate(reversed(lst)):
                 real_idx = len(lst) - 1 - i
-                y = i * 84 - self.app.scroll_y
+                y = i * 84 - self.scroll_y
                 if y > clip_h: break
-                if y < -84:   continue
+                if y < -84:    continue
 
                 card = pygame.Rect(10, y + 4, W - 20, 76)
                 hov  = card.collidepoint(mouse[0], mouse[1] - content_top)
@@ -363,27 +417,32 @@ class GUINormal:
                 meta = f"⏱ {entri['waktu']}  ·  {entri['panjang']} karakter"
                 clip_surf.blit(self.fnt_small.render(meta, True, C["text_dim"]), (60, y + 34))
 
-                # Tombol
-                btn_copy = pygame.Rect(W - 305, y + 20, 80, 24)
-                btn_wa   = pygame.Rect(W - 215, y + 20, 88, 24)
-                btn_del  = pygame.Rect(W - 118, y + 20, 76, 24)
+                # ── Posisi tombol ─────────────────────────────────────────
+                btn_copy_local = pygame.Rect(W - 305, y + 20, 80, 24)
+                btn_wa_local   = pygame.Rect(W - 215, y + 20, 88, 24)
+                btn_del_local  = pygame.Rect(W - 118, y + 20, 76, 24)
 
-                hc = btn_copy.collidepoint(mouse[0], mouse[1] - content_top)
-                hw = btn_wa.collidepoint(mouse[0], mouse[1] - content_top)
-                hd = btn_del.collidepoint(mouse[0], mouse[1] - content_top)
+                # Koordinat absolut untuk hit-test event handler
+                btn_copy_abs = pygame.Rect(btn_copy_local.x, btn_copy_local.y + content_top, btn_copy_local.w, btn_copy_local.h)
+                btn_wa_abs   = pygame.Rect(btn_wa_local.x,   btn_wa_local.y   + content_top, btn_wa_local.w,   btn_wa_local.h)
+                btn_del_abs  = pygame.Rect(btn_del_local.x,  btn_del_local.y  + content_top, btn_del_local.w,  btn_del_local.h)
 
-                draw_rounded_rect(clip_surf, C["accent2"] if hc else (55, 65, 150), btn_copy, r=5)
-                draw_rounded_rect(clip_surf, C["btn_wa_h"] if hw else C["btn_wa"],   btn_wa,   r=5)
-                draw_rounded_rect(clip_surf, C["btn_del_h"] if hd else C["btn_del"], btn_del,  r=5)
+                hc = btn_copy_local.collidepoint(mouse[0], mouse[1] - content_top)
+                hw = btn_wa_local.collidepoint(mouse[0],   mouse[1] - content_top)
+                hd = btn_del_local.collidepoint(mouse[0],  mouse[1] - content_top)
 
-                clip_surf.blit(self.fnt_small.render("📋 Salin",    True, C["text"]),        (btn_copy.x + 8,  btn_copy.y + 5))
-                clip_surf.blit(self.fnt_small.render("📤 Kirim WA", True, (10, 10, 10)),     (btn_wa.x + 6,    btn_wa.y + 5))
-                clip_surf.blit(self.fnt_small.render("🗑 Hapus",    True, C["text"]),        (btn_del.x + 10,  btn_del.y + 5))
+                draw_rounded_rect(clip_surf, C["accent2"] if hc else (55, 65, 150), btn_copy_local, r=5)
+                draw_rounded_rect(clip_surf, C["btn_wa_h"] if hw else C["btn_wa"],   btn_wa_local,   r=5)
+                draw_rounded_rect(clip_surf, C["btn_del_h"] if hd else C["btn_del"], btn_del_local,  r=5)
+
+                clip_surf.blit(self.fnt_small.render("📋 Salin",    True, C["text"]),    (btn_copy_local.x + 8,  btn_copy_local.y + 5))
+                clip_surf.blit(self.fnt_small.render("📤 Kirim WA", True, (10, 10, 10)), (btn_wa_local.x + 6,    btn_wa_local.y + 5))
+                clip_surf.blit(self.fnt_small.render("🗑 Hapus",    True, C["text"]),    (btn_del_local.x + 10,  btn_del_local.y + 5))
 
                 self.card_actions.append({
-                    "rect_copy": pygame.Rect(btn_copy.x, btn_copy.y + content_top, btn_copy.w, btn_copy.h),
-                    "rect_wa":   pygame.Rect(btn_wa.x,   btn_wa.y   + content_top, btn_wa.w,   btn_wa.h),
-                    "rect_del":  pygame.Rect(btn_del.x,  btn_del.y  + content_top, btn_del.w,  btn_del.h),
+                    "rect_copy": btn_copy_abs,
+                    "rect_wa":   btn_wa_abs,
+                    "rect_del":  btn_del_abs,
                     "kategori":  self.app.selected_tab,
                     "idx":       real_idx,
                 })
@@ -405,7 +464,7 @@ class GUINormal:
             return False, None
 
         if event.type == pygame.MOUSEWHEEL:
-            self.app.scroll_y -= event.y * 30
+            self.scroll_y -= event.y * 30
 
         if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
             pos = event.pos
@@ -413,16 +472,20 @@ class GUINormal:
                 return True, "pip"
             for t in self.tab_rects:
                 if t["rect"].collidepoint(pos):
-                    self.app.selected_tab = t["nama"]
-                    self.app.scroll_y = 0
+                    if self.app.selected_tab != t["nama"]:
+                        self.app.selected_tab = t["nama"]
+                        self.scroll_y = 0  # reset scroll saat ganti tab
             for act in self.card_actions:
                 if act["rect_copy"].collidepoint(pos):
                     self.app.salin(act["kategori"], act["idx"])
+                    break
                 if act["rect_wa"].collidepoint(pos):
                     self.app.kirim_wa(act["kategori"], act["idx"])
+                    break
                 if act["rect_del"].collidepoint(pos):
                     self.app.hapus(act["kategori"], act["idx"])
-                    self.app.scroll_y = max(0, self.app.scroll_y - 84)
+                    self.scroll_y = max(0, self.scroll_y - 84)
+                    break
 
         return True, None
 
@@ -442,21 +505,23 @@ class GUIPip:
     def __init__(self, app: ClipboardApp, surf):
         self.app          = app
         self.surf         = surf
-        self.card_actions = []
-        self.tab_rects    = []
-        self.btn_exit_rect= None
-        self.scroll_y     = 0
+        self.card_actions: list = []
+        self.tab_rects: list    = []
+        self.btn_exit_rect      = None
+        self.scroll_y           = 0   # scroll lokal PiP
 
-        self.fnt_head  = pygame.font.SysFont("Segoe UI", 13, bold=True)
-        self.fnt_item  = pygame.font.SysFont("Segoe UI", 12)
-        self.fnt_small = pygame.font.SysFont("Segoe UI", 10)
-        self.fnt_tab   = pygame.font.SysFont("Segoe UI", 11, bold=True)
+        self.fnt_head  = make_font(13, bold=True)
+        self.fnt_item  = make_font(12)
+        self.fnt_small = make_font(10)
+        self.fnt_tab   = make_font(11, bold=True)
 
     def render(self):
         surf  = self.surf
         W, H  = surf.get_size()   # 320 × 500
         mouse = pygame.mouse.get_pos()
         surf.fill(C["bg"])
+
+        # Reset setiap frame
         self.card_actions = []
         self.tab_rects    = []
 
@@ -496,7 +561,7 @@ class GUIPip:
             surf.blit(ls, (r.x + r.w // 2 - ls.get_width() // 2, r.y + 5))
             self.tab_rects.append({"rect": r, "nama": nama})
 
-        # ── Items (compact, 1 baris tiap item = 36px) ────────────────────────
+        # ── Items (compact, 1 baris tiap item = 40px) ────────────────────────
         content_top = tab_y + 28 + 4
         lst = self.app.current_list()
 
@@ -504,7 +569,7 @@ class GUIPip:
             em = self.fnt_item.render("Belum ada — copy sesuatu!", True, C["text_dim"])
             surf.blit(em, (W // 2 - em.get_width() // 2, H // 2))
         else:
-            row_h = 40
+            row_h      = 40
             max_scroll = max(0, len(lst) * row_h - (H - content_top - 28))
             self.scroll_y = max(0, min(self.scroll_y, max_scroll))
             clip_h = H - content_top - 28
@@ -515,7 +580,7 @@ class GUIPip:
             for i, entri in enumerate(reversed(lst)):
                 real_idx = len(lst) - 1 - i
                 y = i * row_h - self.scroll_y
-                if y > clip_h: break
+                if y > clip_h:  break
                 if y < -row_h: continue
 
                 row = pygame.Rect(4, y + 2, W - 8, row_h - 4)
@@ -524,9 +589,9 @@ class GUIPip:
                     C["card_hover"] if hov else C["card"], row, r=6,
                     border=1, border_color=C["accent"] if hov else C["border"])
 
-                # Teks + meta
+                # Teks lebih pendek agar tidak bertabrakan dengan tombol hapus
                 clip_surf.blit(
-                    self.fnt_item.render(truncate(entri["teks"], 30), True, C["text"]),
+                    self.fnt_item.render(truncate(entri["teks"], 26), True, C["text"]),
                     (10, y + 6))
                 clip_surf.blit(
                     self.fnt_small.render(entri["waktu"] + " · " + str(entri["panjang"]) + "ch",
@@ -541,7 +606,7 @@ class GUIPip:
                 clip_surf.blit(self.fnt_small.render("✕", True, C["text"]),
                                (btn_del.x + 6, btn_del.y + 6))
 
-                # Klik area utama (bukan tombol hapus) → salin
+                # Area klik utama (ekslusi tombol hapus) → salin
                 click_area = pygame.Rect(row.x, row.y, row.w - 34, row.h)
                 self.card_actions.append({
                     "rect_click": pygame.Rect(click_area.x, click_area.y + content_top,
@@ -575,15 +640,18 @@ class GUIPip:
                 return True, "normal"
             for t in self.tab_rects:
                 if t["rect"].collidepoint(pos):
-                    self.app.selected_tab = t["nama"]
-                    self.scroll_y = 0
+                    if self.app.selected_tab != t["nama"]:
+                        self.app.selected_tab = t["nama"]
+                        self.scroll_y = 0  # reset scroll saat ganti tab
+                    break  
             for act in self.card_actions:
                 if act["rect_del"].collidepoint(pos):
                     self.app.hapus(act["kategori"], act["idx"])
                     self.scroll_y = max(0, self.scroll_y - 40)
+                    break
                 elif act["rect_click"].collidepoint(pos):
-                    # klik item = salin otomatis
                     self.app.salin(act["kategori"], act["idx"])
+                    break
 
         return True, None
 
@@ -610,13 +678,12 @@ def main():
     pygame.display.set_caption("🧠 Segmented Clipboard Manager")
 
     gui_normal = GUINormal(app, surf)
-    gui_pip    = None
-    clock      = pygame.time.Clock()
+    gui_pip: GUIPip | None = None
+    clock  = pygame.time.Clock()
 
     running = True
     while running:
-        events = pygame.event.get()
-        for event in events:
+        for event in pygame.event.get():
             if mode == "normal":
                 ok, action = gui_normal.handle(event)
             else:
@@ -627,7 +694,6 @@ def main():
                 break
 
             if action == "pip" and mode == "normal":
-                # Beralih ke PiP
                 mode = "pip"
                 surf = pygame.display.set_mode((W_PIP, H_PIP))
                 pygame.display.set_caption("Clipboard [PiP]")
@@ -635,7 +701,6 @@ def main():
                 gui_pip = GUIPip(app, surf)
 
             elif action == "normal" and mode == "pip":
-                # Kembali ke Normal
                 mode = "normal"
                 set_always_on_top(False)
                 surf = pygame.display.set_mode((W_NORMAL, H_NORMAL), pygame.RESIZABLE)
@@ -654,9 +719,11 @@ def main():
 
         clock.tick(30)
 
-    app.monitoring = False
+    # Cleanup graceful
+    app.stop_monitor()
     pygame.quit()
     sys.exit()
+
 
 if __name__ == "__main__":
     main()
